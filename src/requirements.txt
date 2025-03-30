@@ -1,0 +1,8 @@
+python-magic
+ffmpeg-python
+yt-dlp
+rich
+typing-extensions
+validators
+pydantic
+argparse
