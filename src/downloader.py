@@ -11,8 +11,10 @@ import subprocess
 import threading
 import queue
 import concurrent.futures
+import platform
+import weakref
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Generator
 from contextlib import contextmanager
 
 import yt_dlp
@@ -26,18 +28,26 @@ from models import VideoDownloadConfig
 
 
 class YouTubeDownloader:
-    def __init__(self, config: VideoDownloadConfig, log_level: int = logging.INFO):
+    def __init__(self, config: VideoDownloadConfig, log_level: int = logging.INFO, extra_handlers=None):
         # Create a UUID for this run
         self.run_uuid = str(uuid.uuid4())[:8]
         
-        # Set up logging
+        # Set up logging with support for additional handlers
         logging.basicConfig(
             level=log_level,
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
             handlers=[logging.StreamHandler()],
             force=True
         )
+        
+        # Create logger with unique identifier
         self.logger = logging.getLogger(f"downloader_{self.run_uuid}")
+        self.logger.setLevel(log_level)
+        
+        # Add any extra handlers passed from batch processor
+        if extra_handlers:
+            for handler in extra_handlers:
+                self.logger.addHandler(handler)
         
         # Set up working directory and final output directory
         base_dir = config.output_dir or Path.cwd()
@@ -48,10 +58,25 @@ class YouTubeDownloader:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # Create a metadata file to track processing information
+        
+        # Initialize temporary resources list for cleanup
+        self._temp_resources = []
+        
+        # Memory management - track large objects
+        self._large_objects = {}
+        
+        # Track temporary directories
+        self._temp_dirs = []
+        
+        # Track if cleanup has been performed
+        self._cleaned_up = False
         self.metadata_path = self.output_dir / "metadata.json"
 
         # Store the config
         self.config = config
+        
+        # Track start time for performance monitoring
+        self._start_time = time.time()
         
         # Initialize video cache
         self.cache_dir = base_dir / ".cache"
@@ -84,7 +109,34 @@ class YouTubeDownloader:
 
         # Rate limiting settings
         self.rate_limit_delay = 2  # seconds between operations
+        
+        # Progress tracking
+        self.progress_callback = None
+        self.current_progress = 0.0
 
+    def set_progress_callback(self, callback):
+        """Set a callback function for progress updates
+        
+        The callback should accept two parameters:
+        - progress: float (0.0 to 1.0)
+        - status: str (descriptive status message)
+        """
+        self.progress_callback = callback
+    
+    def _update_progress(self, progress, status):
+        """Update the current progress and call progress callback if set
+        
+        Args:
+            progress: float between 0.0 and 1.0
+            status: str describing current operation
+        """
+        self.current_progress = progress
+        if self.progress_callback:
+            try:
+                self.progress_callback(progress, status)
+            except Exception as e:
+                self.logger.warning(f"Error in progress callback: {str(e)}")
+    
     @contextmanager
     def _temp_directory(self):
         """Create a temporary directory that auto-cleans using context manager"""
@@ -99,38 +151,106 @@ class YouTubeDownloader:
                 self.logger.warning(f"Failed to clean up temp directory: {str(e)}")
                 
     def _init_cache(self):
-        """Initialize the video cache system"""
+        """Initialize the video cache system with size limits"""
+        # Set cache limits
+        self.max_cache_size_mb = 5000  # 5GB default cache limit
+        self.max_cache_age_days = 30   # Remove items older than 30 days
+        
         if not self.cache_index.exists():
             with open(self.cache_index, 'w') as f:
-                json.dump({}, f)
+                json.dump({
+                    'metadata': {
+                        'last_cleanup': time.time(),
+                        'version': '1.1'
+                    },
+                    'items': {}
+                }, f)
+        else:
+            # Check for cache version and update if needed
+            try:
+                with open(self.cache_index, 'r') as f:
+                    cache = json.load(f)
+                
+                # Convert legacy cache format if needed
+                if 'metadata' not in cache:
+                    updated_cache = {
+                        'metadata': {
+                            'last_cleanup': time.time(),
+                            'version': '1.1'
+                        },
+                        'items': cache  # Move all existing entries to items
+                    }
+                    with open(self.cache_index, 'w') as f:
+                        json.dump(updated_cache, f)
+                        
+                # Check if cache cleanup is needed (once per day)
+                else:
+                    last_cleanup = cache.get('metadata', {}).get('last_cleanup', 0)
+                    if (time.time() - last_cleanup) > 86400:  # 24 hours
+                        self._cleanup_cache()
+            except Exception as e:
+                self.logger.warning(f"Cache initialization error: {str(e)}")
+                # Reset cache if corrupted
+                with open(self.cache_index, 'w') as f:
+                    json.dump({
+                        'metadata': {
+                            'last_cleanup': time.time(),
+                            'version': '1.1'
+                        },
+                        'items': {}
+                    }, f)
                 
     def _get_from_cache(self, video_id: str, quality: str, format: str) -> Optional[Path]:
         """Check if a video exists in cache and return its path"""
         try:
             with open(self.cache_index, 'r') as f:
                 cache = json.load(f)
+            
+            # Handle legacy or new format    
+            items = cache.get('items', cache)  # Support both formats
                 
             cache_key = f"{video_id}_{quality}_{format}"
-            if cache_key in cache:
-                cached_file = Path(cache[cache_key]['path'])
+            if cache_key in items:
+                cached_file = Path(items[cache_key]['path'])
                 if cached_file.exists():
+                    # Update last accessed time
+                    if 'items' in cache:
+                        cache['items'][cache_key]['last_accessed'] = time.time()
+                        with open(self.cache_index, 'w') as f:
+                            json.dump(cache, f)
+                    
                     self.logger.info(f"Found video in cache: {cached_file.name}")
                     return cached_file
                 else:
                     # Remove invalid cache entry
-                    del cache[cache_key]
-                    with open(self.cache_index, 'w') as f:
-                        json.dump(cache, f)
+                    if 'items' in cache:
+                        del cache['items'][cache_key]
+                        with open(self.cache_index, 'w') as f:
+                            json.dump(cache, f)
+                    else:
+                        del cache[cache_key]
+                        with open(self.cache_index, 'w') as f:
+                            json.dump(cache, f)
         except Exception as e:
             self.logger.warning(f"Cache read error: {str(e)}")
             
         return None
         
     def _add_to_cache(self, video_id: str, quality: str, format: str, file_path: Path) -> None:
-        """Add a video to the cache"""
+        """Add a video to the cache with improved metadata"""
         try:
             with open(self.cache_index, 'r') as f:
                 cache = json.load(f)
+            
+            # Ensure cache has the new format
+            if 'metadata' not in cache:
+                cache = {
+                    'metadata': {
+                        'last_cleanup': time.time(),
+                        'version': '1.1'
+                    },
+                    'items': cache  # Move existing entries
+                }
                 
             # Generate cache key
             cache_key = f"{video_id}_{quality}_{format}"
@@ -139,20 +259,148 @@ class YouTubeDownloader:
             cache_file = self.cache_dir / file_path.name
             shutil.copy2(file_path, cache_file)
             
-            # Update cache index
-            cache[cache_key] = {
+            # Update cache index with enhanced metadata
+            cache['items'][cache_key] = {
                 'path': str(cache_file),
                 'created': time.time(),
-                'size': cache_file.stat().st_size
+                'last_accessed': time.time(),
+                'size': cache_file.stat().st_size,
+                'video_id': video_id,
+                'quality': quality,
+                'format': format
             }
             
             with open(self.cache_index, 'w') as f:
                 json.dump(cache, f)
                 
             self.logger.info(f"Added video to cache: {cache_file.name}")
+            
+            # Check cache size after adding new item
+            self._check_cache_size()
+            
         except Exception as e:
             self.logger.warning(f"Cache write error: {str(e)}")
             
+    def _check_cache_size(self):
+        """Check the size of the cache directory and clean up if needed"""
+        try:
+            # Calculate total cache size
+            total_size = sum(f.stat().st_size for f in self.cache_dir.glob('**/*') if f.is_file())
+            total_size_mb = total_size / (1024 * 1024)
+            
+            self.logger.debug(f"Current cache size: {total_size_mb:.2f} MB")
+            
+            # Check if cache exceeds size limit
+            if total_size_mb > self.max_cache_size_mb:
+                self.logger.info(f"Cache exceeds size limit ({total_size_mb:.2f} MB > {self.max_cache_size_mb} MB). Cleaning up...")
+                self._cleanup_cache()
+        except Exception as e:
+            self.logger.warning(f"Error checking cache size: {str(e)}")
+    
+    def _cleanup_cache(self):
+        """Remove old files from the cache based on age and size limits"""
+        try:
+            self.logger.info("Cleaning up cache...")
+            
+            with open(self.cache_index, 'r') as f:
+                cache = json.load(f)
+            
+            # Handle legacy format
+            if 'metadata' not in cache:
+                cache = {
+                    'metadata': {
+                        'last_cleanup': time.time(),
+                        'version': '1.1'
+                    },
+                    'items': cache
+                }
+            
+            # Get list of cache items sorted by last access time (oldest first)
+            cache_items = cache.get('items', {})
+            if not cache_items:
+                # Update cleanup timestamp
+                cache['metadata']['last_cleanup'] = time.time()
+                with open(self.cache_index, 'w') as f:
+                    json.dump(cache, f)
+                return
+            
+            # First pass: remove entries older than max_cache_age_days
+            current_time = time.time()
+            max_age_seconds = self.max_cache_age_days * 86400
+            
+            removed_count = 0
+            saved_space = 0
+            
+            # Remove old entries
+            for key, item in list(cache_items.items()):
+                # Skip if key already removed
+                if key not in cache_items:
+                    continue
+                    
+                created_time = item.get('created', item.get('last_accessed', current_time))
+                if (current_time - created_time) > max_age_seconds:
+                    # Remove the file
+                    try:
+                        file_path = Path(item['path'])
+                        if file_path.exists():
+                            file_size = file_path.stat().st_size
+                            file_path.unlink()
+                            saved_space += file_size
+                            removed_count += 1
+                    except Exception as e:
+                        self.logger.warning(f"Failed to remove cache file: {str(e)}")
+                    
+                    # Remove from index
+                    del cache_items[key]
+            
+            # Second pass: if still over size limit, remove least recently used files
+            total_size = sum(f.stat().st_size for f in self.cache_dir.glob('**/*') if f.is_file())
+            total_size_mb = total_size / (1024 * 1024)
+            
+            if total_size_mb > self.max_cache_size_mb:
+                # Sort items by last accessed time (oldest first)
+                sorted_items = sorted(
+                    [(k, v) for k, v in cache_items.items()],
+                    key=lambda x: x[1].get('last_accessed', x[1].get('created', 0))
+                )
+                
+                # Remove oldest items until we're under the limit
+                for key, item in sorted_items:
+                    if total_size_mb <= self.max_cache_size_mb:
+                        break
+                    
+                    # Skip if key already removed
+                    if key not in cache_items:
+                        continue
+                    
+                    try:
+                        file_path = Path(item['path'])
+                        if file_path.exists():
+                            file_size = file_path.stat().st_size
+                            file_size_mb = file_size / (1024 * 1024)
+                            file_path.unlink()
+                            total_size_mb -= file_size_mb
+                            saved_space += file_size
+                            removed_count += 1
+                    except Exception as e:
+                        self.logger.warning(f"Failed to remove cache file: {str(e)}")
+                    
+                    # Remove from index
+                    del cache_items[key]
+            
+            # Update cache with changes
+            cache['metadata']['last_cleanup'] = current_time
+            with open(self.cache_index, 'w') as f:
+                json.dump(cache, f)
+                
+            if removed_count > 0:
+                self.logger.info(f"Cache cleanup: Removed {removed_count} files, freed {saved_space / (1024 * 1024):.2f} MB")
+            else:
+                self.logger.info("Cache cleanup: No files needed to be removed")
+                
+        except Exception as e:
+            self.logger.error(f"Cache cleanup error: {str(e)}")
+    
     def _extract_video_id(self, url: str) -> Optional[str]:
         """Extract video ID from YouTube URL"""
         patterns = [
@@ -168,31 +416,90 @@ class YouTubeDownloader:
         return None
         
     def _detect_hardware_acceleration(self) -> Optional[str]:
-        """Detect available hardware acceleration"""
+        """Detect available hardware acceleration with enhanced security"""
         try:
-            # Try to detect available hardware acceleration
+            # Command for hardware acceleration detection (fixed, no variable input)
+            command = ['ffmpeg', '-hide_banner', '-hwaccels']
+            
+            # Safety check: Ensure no command injection is possible
+            for item in command:
+                if not isinstance(item, str) or any(c in item for c in [';', '&', '|', '`', '$', '\\']):
+                    self.logger.error(f"Security: Invalid character in command: {item}")
+                    return None
+            
+            # Execute with specific security enhancements
             hw_check = subprocess.run(
-                ['ffmpeg', '-hide_banner', '-hwaccels'],
+                command,
                 stdout=subprocess.PIPE, 
                 stderr=subprocess.PIPE,
-                timeout=5,
-                text=True
+                timeout=5,  # Short timeout for quick operation
+                text=True,
+                shell=False,  # Explicitly prevent shell execution
+                env={**os.environ, 'PYTHONIOENCODING': 'utf-8'},  # Ensure consistent encoding
+                check=False  # Don't raise exception on non-zero exit
             )
+            
+            if hw_check.returncode != 0:
+                self.logger.warning(f"Hardware acceleration detection failed with code {hw_check.returncode}")
+                # Still proceed with output parsing, as partial info may be useful
+            
             output = hw_check.stdout + hw_check.stderr
             
-            # Check for various hardware acceleration options
-            if 'cuda' in output or 'nvenc' in output:
-                self.logger.info("Detected NVIDIA GPU acceleration")
-                return 'cuda'
-            elif 'videotoolbox' in output:  # macOS
-                self.logger.info("Detected macOS VideoToolbox acceleration")
-                return 'videotoolbox'
-            elif 'qsv' in output:  # Intel QuickSync
-                self.logger.info("Detected Intel QuickSync acceleration")
-                return 'qsv'
-            elif 'vaapi' in output:  # VA-API
-                self.logger.info("Detected VA-API acceleration")
-                return 'vaapi'
+            # Enhanced detection of hardware acceleration options with fallback priorities
+            hw_accel_options = []
+            
+            # Check for NVIDIA GPU acceleration (preferred on Windows/Linux with NVIDIA GPU)
+            if 'cuda' in output or 'nvenc' in output or 'cuvid' in output:
+                hw_accel_options.append(('cuda', 'NVIDIA GPU acceleration'))
+                
+            # Check for macOS VideoToolbox (preferred on macOS)
+            if 'videotoolbox' in output:
+                hw_accel_options.append(('videotoolbox', 'macOS VideoToolbox acceleration'))
+                
+            # Check for Intel QuickSync (good fallback on systems with Intel GPUs)
+            if 'qsv' in output:
+                hw_accel_options.append(('qsv', 'Intel QuickSync acceleration'))
+                
+            # Check for AMD GPU acceleration
+            if 'amf' in output or 'vce' in output:
+                hw_accel_options.append(('amf', 'AMD GPU acceleration'))
+                
+            # Check for VA-API (Linux)
+            if 'vaapi' in output:
+                hw_accel_options.append(('vaapi', 'VA-API acceleration'))
+                
+            # Implement OS-specific preferences for better results
+            system = platform.system().lower()
+            
+            # Select the best option based on OS and availability
+            if hw_accel_options:
+                if system == 'darwin':  # macOS
+                    # Prefer VideoToolbox on macOS, then fall back to others
+                    for hw, desc in hw_accel_options:
+                        if hw == 'videotoolbox':
+                            self.logger.info(f"Detected {desc} (recommended for macOS)")
+                            return hw
+                elif system == 'windows':
+                    # On Windows prefer NVIDIA, then AMD, then Intel
+                    priority_order = ['cuda', 'amf', 'qsv']
+                    for priority in priority_order:
+                        for hw, desc in hw_accel_options:
+                            if hw == priority:
+                                self.logger.info(f"Detected {desc} (recommended for Windows)")
+                                return hw
+                else:  # Linux and others
+                    # On Linux prefer NVIDIA, VAAPI, then others
+                    priority_order = ['cuda', 'vaapi', 'amf', 'qsv']
+                    for priority in priority_order:
+                        for hw, desc in hw_accel_options:
+                            if hw == priority:
+                                self.logger.info(f"Detected {desc} (recommended for Linux)")
+                                return hw
+                
+                # If no OS-specific preference was found, use the first available
+                hw, desc = hw_accel_options[0]
+                self.logger.info(f"Detected {desc}")
+                return hw
             else:
                 self.logger.info("No hardware acceleration detected, using software encoding")
                 return None
@@ -302,6 +609,9 @@ class YouTubeDownloader:
         # Create a custom progress hook
         progress_status = self.console.status("[bold blue]Downloading video...", spinner="dots")
         progress_status.start()
+        
+        # Initialize progress
+        self._update_progress(0.0, "Starting download...")
 
         try:
             # Check if video exists in cache
@@ -318,9 +628,34 @@ class YouTubeDownloader:
                     # Copy cached file to output directory
                     output_file = self.output_dir / cached_path.name
                     shutil.copy2(cached_path, output_file)
+                    # Update progress to complete
+                    self._update_progress(1.0, f"Using cached video: {cached_path.name}")
                     return output_file
             # Create a callback to properly handle progress updates
             def progress_hook(d):
+                status = d.get('status', '')
+                progress = 0.0
+                
+                if status == 'downloading':
+                    # Calculate download progress
+                    total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+                    downloaded_bytes = d.get('downloaded_bytes', 0)
+                    if total_bytes > 0:
+                        progress = min(downloaded_bytes / total_bytes * 0.7, 0.7)  # Max 70% for download phase
+                    
+                    # Get speed and ETA information
+                    speed = d.get('speed', 0)
+                    eta = d.get('eta', 0)
+                    speed_str = f"{speed/1024/1024:.2f} MB/s" if speed else "unknown"
+                    eta_str = f"{eta}s" if eta else "unknown"
+                    
+                    status_msg = f"Downloading... {progress*100:.1f}% at {speed_str} (ETA: {eta_str})"
+                    self._update_progress(progress, status_msg)
+                
+                elif status == 'finished':
+                    self._update_progress(0.7, "Download complete, processing...")
+                
+                # Also call the original progress hook for console display
                 self._download_progress(d, progress_status)
 
             # Setup yt-dlp options with secure defaults and improved codec selection
@@ -336,21 +671,31 @@ class YouTubeDownloader:
                 "sleep_interval": 1,  # Sleep between requests
                 "max_sleep_interval": 5,
                 # Enhanced error handling
-                "ignoreerrors": False,
+                "ignoreerrors": True,  # Changed to True to continue on errors
                 "no_color": True,
                 # Performance tuning
                 "concurrent_fragments": 3,  # Use multiple connections for fragments
                 # Add metadata
                 "add_metadata": True,
                 # Extra security and performance settings
-                "socket_timeout": 30,  # Shorter socket timeout
-                "retries": 3,  # Retry on connection errors
+                "socket_timeout": 15,  # Shorter socket timeout to prevent hanging
+                "retries": 5,  # Increased retries on connection errors
                 "skip_unavailable_fragments": True,  # Skip unavailable fragments
                 "geo_bypass": True,  # Try to bypass geo restrictions
                 # Prefer better codecs
                 "postprocessor_args": {
                     "ffmpeg": ["-threads", "4", "-nostdin"]
                 },
+                # Add timeout to prevent hanging
+                "http_chunk_size": 10485760,  # 10MB chunks for better progress reporting
+                "external_downloader_args": [
+                    "--connect-timeout", "15",
+                    "--max-time", "300",  # 5 minute max download time per segment
+                    "--retry", "3",
+                    "--retry-delay", "5"
+                ],
+                # Prevent downloading entire playlists when processing individual URLs
+                "noplaylist": True,  # Only download the video, not the playlist
             }
 
             # Adjust options for audio-only mode
@@ -376,59 +721,83 @@ class YouTubeDownloader:
                     ],
                 })
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Create a timeout mechanism to prevent hanging downloads
+            download_thread = None
+            download_result = {"success": False, "info": None, "error": None}
+            
+            def download_with_timeout():
                 try:
-                    info_dict = ydl.extract_info(str(self.config.url), download=True)
-                    progress_status.stop()
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(str(self.config.url), download=True)
+                        download_result["success"] = True
+                        download_result["info"] = info
+                except Exception as e:
+                    download_result["error"] = str(e)
+            
+            # Start download in a separate thread
+            download_thread = threading.Thread(target=download_with_timeout)
+            download_thread.daemon = True  # Allow the thread to be terminated when the main thread exits
+            download_thread.start()
+            
+            # Wait for download with timeout (5 minutes)
+            download_thread.join(timeout=300)  # 5 minute timeout
+            
+            # Check if download completed or timed out
+            if download_thread.is_alive():
+                self.logger.error("Download timed out after 5 minutes")
+                progress_status.stop()
+                self._update_progress(1.0, "Error: Download timed out")
+                return None
+            
+            progress_status.stop()
+            
+            # Check download result
+            if not download_result["success"]:
+                error_msg = download_result["error"] or "Unknown download error"
+                self.logger.error(f"Download failed: {error_msg}")
+                self._update_progress(1.0, f"Error: {error_msg}")
+                return None
+                
+            info_dict = download_result["info"]
 
-                    # Find the downloaded file
-                    possible_extensions = [
-                        self.config.audio_format if self.config.audio_only else self.config.video_format,
-                        'mp3', 'mp4', 'mkv', 'webm', 'wav', 'aac', 'flac'
-                    ]
+            # Find the downloaded file
+            possible_extensions = [
+                self.config.audio_format if self.config.audio_only else self.config.video_format,
+                'mp3', 'mp4', 'mkv', 'webm', 'wav', 'aac', 'flac'
+            ]
 
-                    for ext in possible_extensions:
-                        potential_files = list(temp_dir.glob(f"*.{ext}"))
-                        if potential_files:
-                            downloaded_file = potential_files[0]
-                            # Sanitize filename before returning
-                            safe_filename = self._sanitize_filename(downloaded_file.name)
-                            safe_path = temp_dir / safe_filename
+            for ext in possible_extensions:
+                potential_files = list(temp_dir.glob(f"*.{ext}"))
+                if potential_files:
+                    downloaded_file = potential_files[0]
+                    # Sanitize filename before returning
+                    safe_filename = self._sanitize_filename(downloaded_file.name)
+                    safe_path = temp_dir / safe_filename
 
-                            # If the sanitized name is different, rename the file
-                            if safe_filename != downloaded_file.name:
-                                downloaded_file.rename(safe_path)
-                                downloaded_file = safe_path
+                    # If the sanitized name is different, rename the file
+                    if safe_filename != downloaded_file.name:
+                        downloaded_file.rename(safe_path)
+                        downloaded_file = safe_path
 
-                            self.logger.info(f"{'Audio' if self.config.audio_only else 'Video'} Downloaded: {safe_filename}")
-                            
-                            # Add to cache if not in downsize mode and we have a video_id
-                            if video_id and not self.config.downsize and not self.config.audio_only:
-                                output_file = self.output_dir / safe_filename
-                                shutil.copy2(safe_path, output_file)
-                                self._add_to_cache(video_id, self.config.quality, self.config.video_format, output_file)
-                                
-                            return downloaded_file
+                    self.logger.info(f"{'Audio' if self.config.audio_only else 'Video'} Downloaded: {safe_filename}")
+                    
+                    # Add to cache if not in downsize mode and we have a video_id
+                    if video_id and not self.config.downsize and not self.config.audio_only:
+                        output_file = self.output_dir / safe_filename
+                        shutil.copy2(safe_path, output_file)
+                        self._add_to_cache(video_id, self.config.quality, self.config.video_format, output_file)
+                    
+                    # Final progress update - complete
+                    self._update_progress(1.0, f"Download complete: {safe_filename}")
+                        
+                    return downloaded_file
 
-                    # Detailed logging if no file is found
-                    self.logger.error(f"No files found with extensions: {possible_extensions}")
-                    self.logger.error(f"Temp directory contents: {list(temp_dir.iterdir())}")
-                    return None
-
-                except Exception as extract_error:
-                    # More detailed error logging
-                    error_msg = str(extract_error)
-                    self.logger.error(f"Extraction Error: {error_msg}")
-
-                    # Print more context about the error
-                    self.console.print(
-                        Panel(
-                            f"Detailed Download Error: {error_msg}",
-                            title="Download Failed",
-                            border_style="red"
-                        )
-                    )
-                    return None
+            # Detailed logging if no file is found
+            self.logger.error(f"No files found with extensions: {possible_extensions}")
+            self.logger.error(f"Temp directory contents: {list(temp_dir.iterdir())}")
+            # Update progress with error
+            self._update_progress(1.0, "Error: No output files found after download")
+            return None
 
         except Exception as e:
             progress_status.stop()
@@ -445,6 +814,8 @@ class YouTubeDownloader:
                     border_style="red"
                 )
             )
+            # Update progress with error
+            self._update_progress(1.0, f"Error: {error_msg}")
             self.logger.error(f"Download error: {error_msg}")
             return None
 
@@ -645,6 +1016,12 @@ class YouTubeDownloader:
                 timeout = min(600, max(60, int(duration * 0.8)))
                 
                 try:
+                    # Security validation of ffmpeg command
+                    for item in ffmpeg_command:
+                        if isinstance(item, str) and any(c in item for c in [';', '&', '|', '`', '$', '\\']):
+                            self.logger.error(f"Security: Potential command injection detected in: {item}")
+                            return input_path
+                    
                     # Start FFmpeg process with enhanced security
                     process = subprocess.Popen(
                         ffmpeg_command,
@@ -652,7 +1029,9 @@ class YouTubeDownloader:
                         stderr=subprocess.PIPE,
                         stdin=subprocess.DEVNULL,  # Explicitly prevent stdin
                         universal_newlines=True,
-                        errors='replace'  # Handle potential encoding errors
+                        errors='replace',  # Handle potential encoding errors
+                        shell=False,  # Explicitly prevent shell execution
+                        env={**os.environ, 'PYTHONIOENCODING': 'utf-8'}  # Ensure consistent encoding
                     )
                     
                     # Start a thread to monitor progress
@@ -706,6 +1085,65 @@ class YouTubeDownloader:
             self.logger.error(f"Downsizing error: {str(e)}")
             return input_path  # Return original on any error
 
+    def cleanup(self) -> None:
+        """Clean up all temporary resources and release memory
+        Call this method when done with the downloader instance to prevent memory leaks
+        """
+        if self._cleaned_up:
+            self.logger.debug("Cleanup already performed, skipping")
+            return
+            
+        try:
+            self.logger.info("Performing resource cleanup")
+            
+            # Get execution time
+            execution_time = time.time() - self._start_time
+            self.logger.info(f"Total execution time: {execution_time:.2f} seconds")
+            
+            # Close any open file handlers
+            for handler in self.logger.handlers:
+                if isinstance(handler, logging.FileHandler):
+                    try:
+                        handler.close()
+                    except Exception as e:
+                        self.logger.debug(f"Error closing log handler: {e}")
+            
+            # Cleanup temporary directories
+            for temp_dir in self._temp_dirs:
+                try:
+                    temp_dir.cleanup()
+                    self.logger.debug(f"Cleaned up temporary directory")
+                except Exception as e:
+                    self.logger.debug(f"Error cleaning up temp directory: {e}")
+            
+            # Remove references to large objects
+            self._large_objects.clear()
+            
+            # Clear any cached data
+            if hasattr(self, 'yt_downloader'):
+                self.yt_downloader = None
+            
+            # Force garbage collection to reclaim memory
+            import gc
+            collected = gc.collect()
+            self.logger.debug(f"Garbage collection: {collected} objects collected")
+            
+            # Mark as cleaned up
+            self._cleaned_up = True
+            
+            self.logger.info("Resource cleanup completed successfully")
+        except Exception as e:
+            self.logger.error(f"Error during cleanup: {str(e)}")
+    
+    def __del__(self):
+        """Destructor to ensure cleanup"""
+        if not hasattr(self, '_cleaned_up') or not self._cleaned_up:
+            try:
+                self.cleanup()
+            except:
+                # Suppress errors in destructor
+                pass
+    
     def extract_audio(self, input_path: Path, temp_dir: Path) -> Optional[Path]:
         """Enhanced audio extraction with robust codec and stream handling"""
         if not input_path.exists():
@@ -799,12 +1237,24 @@ class YouTubeDownloader:
         ]
 
         try:
-            # Run FFmpeg with error capture
+            # Security: Validate FFmpeg command for security issues
+            for item in ffmpeg_command:
+                if isinstance(item, str) and any(c in item for c in [';', '&', '|', '`', '$', '\\']):
+                    security_error = f"Security: Potential command injection detected in: {item}"
+                    self.logger.error(security_error)
+                    self.console.print(Panel(security_error, title="Security Error", border_style="red"))
+                    return None
+            
+            # Run FFmpeg with enhanced security and error handling
             process = subprocess.Popen(
                 ffmpeg_command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                universal_newlines=True
+                stdin=subprocess.DEVNULL,  # Prevent stdin interaction
+                universal_newlines=True,
+                errors='replace',  # Handle encoding errors gracefully
+                shell=False,  # Explicitly prevent shell execution
+                env={**os.environ, 'PYTHONIOENCODING': 'utf-8'}  # Ensure consistent encoding
             )
 
             # Capture output
