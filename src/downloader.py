@@ -16,6 +16,7 @@ import weakref
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Generator
 from contextlib import contextmanager
+import sys
 
 import yt_dlp
 import ffmpeg
@@ -612,7 +613,7 @@ class YouTubeDownloader:
         
         # Initialize progress
         self._update_progress(0.0, "Starting download...")
-
+        
         try:
             # Check if video exists in cache
             video_id = self._extract_video_id(str(self.config.url))
@@ -811,7 +812,7 @@ class YouTubeDownloader:
                 Panel(
                     f"Download Error: {error_msg}",
                     title="Download Failed",
-                    border_style="red"
+                    border_style="red",
                 )
             )
             # Update progress with error
@@ -1017,9 +1018,46 @@ class YouTubeDownloader:
                 
                 try:
                     # Security validation of ffmpeg command
+                    def is_safe_command_component(item):
+                        import re
+                        import os
+                        
+                        # Check if item is a string
+                        if not isinstance(item, str):
+                            return True
+                        
+                        # Windows-specific path validation
+                        if os.name == 'nt':
+                            # Allow Windows-style paths and command components
+                            safe_pattern = r'^[a-zA-Z0-9_.:\/\-\\]+$'
+                            
+                            # Additional checks for Windows
+                            # Prevent absolute paths outside of known safe directories
+                            if re.search(r'^[a-zA-Z]:\\', item):
+                                # Restrict to specific safe base paths
+                                safe_base_paths = [
+                                    r'C:\\Windows', 
+                                    r'C:\\Program Files', 
+                                    r'C:\\Program Files (x86)', 
+                                    r'C:\\Users',
+                                    os.path.dirname(sys.executable)  # Python installation directory
+                                ]
+                                if not any(item.startswith(safe_path) for safe_path in safe_base_paths):
+                                    return False
+                        else:
+                            # Unix-like systems
+                            safe_pattern = r'^[a-zA-Z0-9_./\-:]+$'
+                        
+                        # Validate against safe pattern
+                        return re.match(safe_pattern, item) is not None and \
+                               not any(dangerous in item for dangerous in ['..', '&&', '||', ';', '`', '$'])
+                    
+                    # Validate each command component
                     for item in ffmpeg_command:
-                        if isinstance(item, str) and any(c in item for c in [';', '&', '|', '`', '$', '\\']):
-                            self.logger.error(f"Security: Potential command injection detected in: {item}")
+                        if not is_safe_command_component(item):
+                            security_error = f"Security: Potential command injection detected in: {item}"
+                            self.logger.error(security_error)
+                            self.console.print(Panel(security_error, title="Security Error", border_style="red"))
                             return input_path
                     
                     # Start FFmpeg process with enhanced security
@@ -1027,13 +1065,13 @@ class YouTubeDownloader:
                         ffmpeg_command,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
-                        stdin=subprocess.DEVNULL,  # Explicitly prevent stdin
+                        stdin=subprocess.DEVNULL,  # Prevent stdin interaction
                         universal_newlines=True,
-                        errors='replace',  # Handle potential encoding errors
+                        errors='replace',  # Handle encoding errors gracefully
                         shell=False,  # Explicitly prevent shell execution
                         env={**os.environ, 'PYTHONIOENCODING': 'utf-8'}  # Ensure consistent encoding
                     )
-                    
+
                     # Start a thread to monitor progress
                     with Status("[bold blue]Downsizing video... analyzing", console=self.console) as status:
                         # Start a thread to monitor progress
@@ -1238,8 +1276,43 @@ class YouTubeDownloader:
 
         try:
             # Security: Validate FFmpeg command for security issues
+            def is_safe_command_component(item):
+                import re
+                import os
+                
+                # Check if item is a string
+                if not isinstance(item, str):
+                    return True
+                
+                # Windows-specific path validation
+                if os.name == 'nt':
+                    # Allow Windows-style paths and command components
+                    safe_pattern = r'^[a-zA-Z0-9_.:\/\-\\]+$'
+                    
+                    # Additional checks for Windows
+                    # Prevent absolute paths outside of known safe directories
+                    if re.search(r'^[a-zA-Z]:\\', item):
+                        # Restrict to specific safe base paths
+                        safe_base_paths = [
+                            r'C:\\Windows', 
+                            r'C:\\Program Files', 
+                            r'C:\\Program Files (x86)', 
+                            r'C:\\Users',
+                            os.path.dirname(sys.executable)  # Python installation directory
+                        ]
+                        if not any(item.startswith(safe_path) for safe_path in safe_base_paths):
+                            return False
+                else:
+                    # Unix-like systems
+                    safe_pattern = r'^[a-zA-Z0-9_./\-:]+$'
+                
+                # Validate against safe pattern
+                return re.match(safe_pattern, item) is not None and \
+                       not any(dangerous in item for dangerous in ['..', '&&', '||', ';', '`', '$'])
+            
+            # Validate each command component
             for item in ffmpeg_command:
-                if isinstance(item, str) and any(c in item for c in [';', '&', '|', '`', '$', '\\']):
+                if not is_safe_command_component(item):
                     security_error = f"Security: Potential command injection detected in: {item}"
                     self.logger.error(security_error)
                     self.console.print(Panel(security_error, title="Security Error", border_style="red"))
